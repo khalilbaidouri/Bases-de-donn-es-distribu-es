@@ -1,7 +1,11 @@
 # EShop Multibase — Base de Données Distribuée
 
+[![Oracle](https://img.shields.io/badge/Oracle-21c%20XE-red?logo=oracle)](https://container-registry.oracle.com)
+[![Docker](https://img.shields.io/badge/Docker-Compose-blue?logo=docker)](https://docs.docker.com/compose/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
 > Infrastructure Oracle 21c XE distribuée avec fragmentation horizontale.  
-> **3 nœuds Oracle** · **Docker Compose** · **DB Links** · **Triggers de synchronisation**
+> **3 nœuds Oracle** · **Docker Compose** · **DB Links** · **Triggers de synchronisation** · **Package anti-boucle**
 
 ---
 
@@ -22,6 +26,13 @@
 │  user: eshop1                        user: eshop2       │
 └─────────────────────────────────────────────────────────┘
 ```
+
+### Règle de fragmentation horizontale
+
+| Condition | Destination |
+|---|---|
+| `Quantite >= 100` | Site1 (gros volumes) |
+| `Quantite < 100` | Site2 (petits volumes) |
 
 ---
 
@@ -64,7 +75,7 @@ docker compose ps
 # Les 3 conteneurs doivent afficher STATUS = healthy
 ```
 
-### 5. Configurer le réseau Oracle
+### 5. Configurer le réseau Oracle (TNS)
 
 ```bash
 # Sur oracle-global
@@ -89,11 +100,11 @@ docker exec -it eshop-site2  bash -c "tnsping GLOBAL"
 ### 6. Initialiser oracle-global
 
 ```bash
-docker cp "scripts/global/01_user.sql"      eshop-global:/tmp/
-docker cp "scripts/global/02_tables.sql"    eshop-global:/tmp/
-docker cp "scripts/global/03_data.sql"      eshop-global:/tmp/
-docker cp "scripts/global/04_dblinks.sql"   eshop-global:/tmp/
-docker cp "scripts/global/05_triggers.sql"  eshop-global:/tmp/
+docker cp "scripts/global/01_user.sql"         eshop-global:/tmp/
+docker cp "scripts/global/02_tables.sql"       eshop-global:/tmp/
+docker cp "scripts/global/03_data.sql"         eshop-global:/tmp/
+docker cp "scripts/global/04_dblinks.sql"      eshop-global:/tmp/
+docker cp "scripts/global/05_triggers.sql"     eshop-global:/tmp/
 docker cp "scripts/global/06_optimisation.sql" eshop-global:/tmp/
 
 docker exec -it eshop-global sqlplus "sys/Oracle123@localhost/XEPDB1 as sysdba" "@/tmp/01_user.sql"
@@ -143,24 +154,23 @@ eshop-distributed/
     ├── global/
     │   ├── 01_user.sql              ← Création utilisateur eshop
     │   ├── 02_tables.sql            ← Tables + séquences SEQ_LIGNE, SEQ_COMMANDE
-    │   ├── 03_data.sql              ← Données de test (8 lignes)
+    │   ├── 03_data.sql              ← Données de test initiales
     │   ├── 04_dblinks.sql           ← DB Links link_site1, link_site2
-    │   ├── 05_triggers.sql          ← SYC_INSERT/UPDATE/DELETE_LIGNE
+    │   ├── 05_triggers.sql          ← SYC_INSERT/UPDATE/DELETE_LIGNE + package sync_ctrl
     │   ├── 06_optimisation.sql      ← Index + EXPLAIN PLAN
-    │   ├── 07_requetes.sql          ← Requêtes distribuées CA 2026
+    │   ├── 07_requetes.sql          ← Requêtes distribuées CA
     │   ├── 08_tests.sql             ← Tests de validation complets
     │   ├── 09_reset_data.sql        ← Remise à zéro des données
-    │   ├── 10_fix_update_global.sql ← Procédure update_global corrigée
     │   └── tnsnames.ora             ← Résolution SITE1, SITE2
     ├── site1/
     │   ├── 01_site1_schema.sql      ← Tables eshop1 (Quantite >= 100)
-    │   ├── 02_procedures.sql        ← insertligne, deleteligne, updateligne
+    │   ├── 02_procedures.sql        ← insert_and_sync, update_and_sync, deleteligne
     │   ├── 04_dblink_global.sql     ← DB Link link_global
     │   ├── triginv.sql              ← TRG_INV_INSERT/UPDATE/DELETE
     │   └── tnsnames_site1.ora       ← Résolution GLOBAL
     └── site2/
         ├── 01_site2_schema.sql      ← Tables eshop2 (Quantite < 100)
-        ├── 02_procedures.sql        ← insertligne, deleteligne, updateligne
+        ├── 02_procedures.sql        ← insert_and_sync, update_and_sync, deleteligne
         ├── 04_dblink_global.sql     ← DB Link link_global
         ├── triginv.sql              ← TRG_INV_INSERT/UPDATE/DELETE
         └── tnsnames_site2.ora       ← Résolution GLOBAL
@@ -179,48 +189,371 @@ eshop-distributed/
 
 ---
 
-## Tests de validation
+## Mécanisme anti-boucle
 
-```bash
-docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1"
+Sans protection, les triggers créent une boucle infinie :
+
+```
+UPDATE Site1 → TRG_INV_UPDATE → UPDATE Global → SYC_UPDATE_LIGNE → UPDATE Site1 → ...
 ```
 
+La solution utilise un **package Oracle** comme flag de session sur Global :
+
 ```sql
--- Test 1 : Comptage des 3 sites
-SELECT 'Global' AS site, COUNT(*) AS total FROM eshop.LigneCommandes
-UNION ALL
-SELECT 'Site1', COUNT(*) FROM eshop1.LigneCommandes1@link_site1
-UNION ALL
-SELECT 'Site2', COUNT(*) FROM eshop2.LigneCommandes2@link_site2;
+CREATE OR REPLACE PACKAGE eshop.sync_ctrl AS
+  g_syncing BOOLEAN := FALSE;
+END sync_ctrl;
 
--- Test 2 : INSERT Global -> auto-routé vers Site1 (Quantite >= 100)
-INSERT INTO Commandes VALUES (99, 1, 1, SYSDATE, NULL);
-INSERT INTO LigneCommandes VALUES (999, 99, 1, 300, 899.99, 10);
-COMMIT;
-SELECT COUNT(*) FROM eshop1.LigneCommandes1@link_site1 WHERE idligneCommande = 999;
--- Résultat attendu : 1
+CREATE OR REPLACE PROCEDURE eshop.set_syncing AS
+BEGIN eshop.sync_ctrl.g_syncing := TRUE; END;
 
--- Test 3 : UPDATE avec migration Site2 -> Site1
-EXEC eshop.update_global(5, 150, 10);
-SELECT 'Site1' AS s, Quantite FROM eshop1.LigneCommandes1@link_site1 WHERE idligneCommande = 5
-UNION ALL
-SELECT 'Site2', Quantite FROM eshop2.LigneCommandes2@link_site2 WHERE idligneCommande = 5;
--- Résultat attendu : Site1=150, Site2=aucune ligne
-EXIT
+CREATE OR REPLACE PROCEDURE eshop.unset_syncing AS
+BEGIN eshop.sync_ctrl.g_syncing := FALSE; END;
+```
+
+Chaque procédure Site active le flag **avant** de propager vers Global, puis le désactive après. Le trigger `SYC_UPDATE/DELETE_LIGNE` vérifie ce flag et s'arrête si actif.
+
+```
+Site1.update_and_sync()
+  → set_syncing@link_global       (flag = TRUE)
+  → UPDATE LigneCommandes@global  (trigger vérifie flag → RETURN)
+  → unset_syncing@link_global     (flag = FALSE)
 ```
 
 ---
 
 ## Triggers Oracle
 
-| Trigger | Sur | Rôle |
+| Trigger | Sur | Événement | Rôle |
+|---|---|---|---|
+| `SYC_INSERT_LIGNE` | Global | AFTER INSERT | Route vers Site1 (≥100) ou Site2 (<100) avec flag anti-boucle |
+| `SYC_UPDATE_LIGNE` | Global | AFTER UPDATE | Propage UPDATE vers le bon site (vérifie flag anti-boucle) |
+| `SYC_DELETE_LIGNE` | Global | AFTER DELETE | Supprime sur le bon site (vérifie flag anti-boucle) |
+| `TRG_INV_INSERT` | Site1 & Site2 | AFTER INSERT | Propage INSERT vers Global si absent |
+| `TRG_INV_UPDATE` | Site1 & Site2 | AFTER UPDATE | Propage UPDATE vers Global via `update_and_sync` |
+| `TRG_INV_DELETE` | Site1 & Site2 | AFTER DELETE | Propage DELETE vers Global |
+
+---
+
+## Procédures stockées
+
+### Sur Global
+
+| Procédure | Paramètres | Rôle |
 |---|---|---|
-| `SYC_INSERT_LIGNE` | oracle-global | Route INSERT vers Site1 (≥100) ou Site2 (<100) |
-| `SYC_UPDATE_LIGNE` | oracle-global | Migre la ligne si le seuil de quantité change |
-| `SYC_DELETE_LIGNE` | oracle-global | Supprime sur le bon site |
-| `TRG_INV_INSERT` | Site1 & Site2 | Propage INSERT vers Global (si absent) |
-| `TRG_INV_UPDATE` | Site1 & Site2 | Propage UPDATE vers Global |
-| `TRG_INV_DELETE` | Site1 & Site2 | Propage DELETE vers Global |
+| `insert_global` | `(idcmd, idprod, qte, prix, remise)` | INSERT avec `SEQ_LIGNE.NEXTVAL` auto + routage trigger |
+| `update_global` | `(idligne, qte, remise)` | UPDATE propagé vers Site1 ou Site2 |
+| `delete_global` | `(idligne)` | DELETE propagé vers Site1 ou Site2 |
+| `set_syncing` | — | Active le flag anti-boucle |
+| `unset_syncing` | — | Désactive le flag anti-boucle |
+
+### Sur Site1 & Site2
+
+| Procédure | Paramètres | Rôle |
+|---|---|---|
+| `insert_and_sync` | `(idcmd, idprod, qte, prix, remise)` | INSERT avec `SEQ_LIGNE.NEXTVAL` + flag anti-boucle |
+| `update_and_sync` | `(idligne, qte, remise)` | UPDATE local + propagation vers Global avec flag |
+| `deleteligne` | `(idligne)` | DELETE local + propagation vers Global |
+
+---
+
+## Séquences Oracle
+
+| Séquence | Sur | Incrément | Usage |
+|---|---|---|---|
+| `SEQ_LIGNE` | Global | 1 | ID auto des LigneCommandes (partagé) |
+| `SEQ_LIGNE` | Site1 | 1 | ID local Site1 |
+| `SEQ_LIGNE` | Site2 | 1 | ID local Site2 |
+| `SEQ_COMMANDE` | Global | 1 | ID auto des Commandes |
+
+---
+
+## Tests de synchronisation
+
+### Connexion Global
+
+```bash
+docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1"
+```
+
+---
+
+### INSERT : Global → Sites
+
+```sql
+SET SERVEROUTPUT ON;
+
+-- INSERT Global → Site1 (quantite >= 100) via procédure
+EXEC eshop.insert_global(1, 1, 200, 100.00, 5);
+
+-- Vérifier sur Global
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+
+-- Vérifier sur Site1 (doit apparaître automatiquement)
+SELECT idligneCommande, quantite, remise FROM eshop1.LigneCommandes1@link_site1
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+-- ✅ Résultat attendu : quantite=200, remise=5
+
+-- INSERT Global → Site2 (quantite < 100) via procédure
+EXEC eshop.insert_global(2, 5, 10, 50.00, 0);
+
+-- Vérifier sur Site2 (doit apparaître automatiquement)
+SELECT idligneCommande, quantite, remise FROM eshop2.LigneCommandes2@link_site2
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+-- ✅ Résultat attendu : quantite=10, remise=0
+```
+
+---
+
+### INSERT : Site1 → Global
+
+```bash
+docker exec -it eshop-site1 sqlplus "eshop1/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+SET SERVEROUTPUT ON;
+
+-- INSERT via procédure (ID généré automatiquement)
+EXEC eshop1.insert_and_sync(1, 1, 150, 100.00, 5);
+
+-- Vérifier sur Site1
+SELECT idligneCommande, quantite, remise FROM LigneCommandes1
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+
+-- Vérifier que Global a reçu
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes@link_global
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+-- ✅ Résultat attendu : ligne présente sur les 2 bases
+```
+
+---
+
+### INSERT : Site2 → Global
+
+```bash
+docker exec -it eshop-site2 sqlplus "eshop2/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+SET SERVEROUTPUT ON;
+
+EXEC eshop2.insert_and_sync(2, 5, 10, 50.00, 0);
+
+SELECT idligneCommande, quantite, remise FROM LigneCommandes2
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes@link_global
+WHERE idligneCommande = SEQ_LIGNE.CURRVAL;
+-- ✅ Résultat attendu : ligne présente sur les 2 bases
+```
+
+---
+
+### UPDATE : Global → Site1
+
+```bash
+docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+-- Valeur avant
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes WHERE idligneCommande = 1;
+
+-- UPDATE via procédure
+EXEC eshop.update_global(1, 999, 50);
+
+-- Vérifier Global
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes WHERE idligneCommande = 1;
+
+-- Vérifier Site1 (propagation automatique)
+SELECT idligneCommande, quantite, remise FROM eshop1.LigneCommandes1@link_site1
+WHERE idligneCommande = 1;
+-- ✅ Résultat attendu : quantite=999, remise=50 sur les 2 bases
+```
+
+---
+
+### UPDATE : Global → Site2
+
+```sql
+-- Valeur avant
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes WHERE idligneCommande = 5;
+
+-- UPDATE via procédure
+EXEC eshop.update_global(5, 80, 20);
+
+-- Vérifier Site2 (propagation automatique)
+SELECT idligneCommande, quantite, remise FROM eshop2.LigneCommandes2@link_site2
+WHERE idligneCommande = 5;
+-- ✅ Résultat attendu : quantite=80, remise=20 sur les 2 bases
+```
+
+---
+
+### UPDATE : Site1 → Global
+
+```bash
+docker exec -it eshop-site1 sqlplus "eshop1/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+-- Valeur avant
+SELECT idligneCommande, quantite, remise FROM LigneCommandes1 WHERE idligneCommande = 1;
+
+-- UPDATE via procédure (avec flag anti-boucle)
+EXEC eshop1.update_and_sync(1, 500, 30);
+
+-- Vérifier Site1
+SELECT idligneCommande, quantite, remise FROM LigneCommandes1 WHERE idligneCommande = 1;
+
+-- Vérifier Global (propagation via TRG_INV_UPDATE)
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes@link_global
+WHERE idligneCommande = 1;
+-- ✅ Résultat attendu : quantite=500, remise=30 sur les 2 bases
+```
+
+---
+
+### UPDATE : Site2 → Global
+
+```bash
+docker exec -it eshop-site2 sqlplus "eshop2/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+-- UPDATE via procédure
+EXEC eshop2.update_and_sync(5, 50, 15);
+
+-- Vérifier Site2
+SELECT idligneCommande, quantite, remise FROM LigneCommandes2 WHERE idligneCommande = 5;
+
+-- Vérifier Global
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes@link_global
+WHERE idligneCommande = 5;
+-- ✅ Résultat attendu : quantite=50, remise=15 sur les 2 bases
+```
+
+---
+
+### DELETE : Site1 → Global
+
+```bash
+docker exec -it eshop-site1 sqlplus "eshop1/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+-- Vérifier avant
+SELECT idligneCommande, quantite, remise FROM LigneCommandes1 WHERE idligneCommande = 1;
+
+-- DELETE via procédure
+EXEC eshop1.deleteligne(1);
+
+-- Vérifier Site1 → doit être 0
+SELECT COUNT(*) AS site1_doit_etre_0 FROM LigneCommandes1 WHERE idligneCommande = 1;
+
+-- Vérifier Global → doit être 0
+SELECT COUNT(*) AS global_doit_etre_0 FROM eshop.LigneCommandes@link_global
+WHERE idligneCommande = 1;
+-- ✅ Résultat attendu : COUNT=0 sur les 2 bases
+```
+
+---
+
+### DELETE : Site2 → Global
+
+```bash
+docker exec -it eshop-site2 sqlplus "eshop2/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+-- DELETE via procédure
+EXEC eshop2.deleteligne(5);
+
+-- Vérifier Site2 → doit être 0
+SELECT COUNT(*) AS site2_doit_etre_0 FROM LigneCommandes2 WHERE idligneCommande = 5;
+
+-- Vérifier Global → doit être 0
+SELECT COUNT(*) AS global_doit_etre_0 FROM eshop.LigneCommandes@link_global
+WHERE idligneCommande = 5;
+-- ✅ Résultat attendu : COUNT=0 sur les 2 bases
+```
+
+---
+
+### DELETE : Global → Site1
+
+```bash
+docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1"
+```
+
+```sql
+-- Vérifier avant
+SELECT idligneCommande, quantite, remise FROM eshop.LigneCommandes WHERE idligneCommande = 2;
+SELECT idligneCommande, quantite, remise FROM eshop1.LigneCommandes1@link_site1
+WHERE idligneCommande = 2;
+
+-- DELETE via procédure
+EXEC eshop.delete_global(2);
+
+-- Vérifier Global → doit être 0
+SELECT COUNT(*) AS global_doit_etre_0 FROM eshop.LigneCommandes WHERE idligneCommande = 2;
+
+-- Vérifier Site1 → doit être 0
+SELECT COUNT(*) AS site1_doit_etre_0 FROM eshop1.LigneCommandes1@link_site1
+WHERE idligneCommande = 2;
+-- ✅ Résultat attendu : COUNT=0 sur les 2 bases
+```
+
+---
+
+### DELETE : Global → Site2
+
+```sql
+-- DELETE via procédure
+EXEC eshop.delete_global(3);
+
+-- Vérifier Global → doit être 0
+SELECT COUNT(*) AS global_doit_etre_0 FROM eshop.LigneCommandes WHERE idligneCommande = 3;
+
+-- Vérifier Site2 → doit être 0
+SELECT COUNT(*) AS site2_doit_etre_0 FROM eshop2.LigneCommandes2@link_site2
+WHERE idligneCommande = 3;
+-- ✅ Résultat attendu : COUNT=0 sur les 2 bases
+```
+
+---
+
+### Vérification globale des 3 sites
+
+```sql
+-- Comptage sur les 3 bases simultanément
+SELECT 'Global' AS site, COUNT(*) AS total FROM eshop.LigneCommandes
+UNION ALL
+SELECT 'Site1',  COUNT(*) FROM eshop1.LigneCommandes1@link_site1
+UNION ALL
+SELECT 'Site2',  COUNT(*) FROM eshop2.LigneCommandes2@link_site2;
+```
+
+---
+
+## Tableau récapitulatif des tests
+
+| # | Opération | Direction | Procédure | Résultat attendu |
+|---|---|---|---|---|
+| 1 | INSERT | Global → Site1 | `insert_global(1,1,200,100,5)` | Présent sur Global + Site1 |
+| 2 | INSERT | Global → Site2 | `insert_global(2,5,10,50,0)` | Présent sur Global + Site2 |
+| 3 | INSERT | Site1 → Global | `insert_and_sync(1,1,150,100,5)` | Présent sur Site1 + Global |
+| 4 | INSERT | Site2 → Global | `insert_and_sync(2,5,10,50,0)` | Présent sur Site2 + Global |
+| 5 | UPDATE | Global → Site1 | `update_global(1,999,50)` | quantite=999, remise=50 sur les 2 |
+| 6 | UPDATE | Global → Site2 | `update_global(5,80,20)` | quantite=80, remise=20 sur les 2 |
+| 7 | UPDATE | Site1 → Global | `update_and_sync(1,500,30)` | quantite=500, remise=30 sur les 2 |
+| 8 | UPDATE | Site2 → Global | `update_and_sync(5,50,15)` | quantite=50, remise=15 sur les 2 |
+| 9 | DELETE | Site1 → Global | `deleteligne(1)` | COUNT=0 sur Site1 + Global |
+| 10 | DELETE | Site2 → Global | `deleteligne(5)` | COUNT=0 sur Site2 + Global |
+| 11 | DELETE | Global → Site1 | `delete_global(2)` | COUNT=0 sur Global + Site1 |
+| 12 | DELETE | Global → Site2 | `delete_global(3)` | COUNT=0 sur Global + Site2 |
 
 ---
 
@@ -235,6 +568,18 @@ docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1"
 docker exec -it eshop-site1  sqlplus "eshop1/Eshop123@localhost/XEPDB1"
 docker exec -it eshop-site2  sqlplus "eshop2/Eshop123@localhost/XEPDB1"
 
+# Vérifier les triggers actifs
+docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1" <<'EOF'
+SELECT trigger_name, status FROM user_triggers ORDER BY trigger_name;
+EXIT
+EOF
+
+# Vérifier les procédures
+docker exec -it eshop-global sqlplus "eshop/Eshop123@localhost/XEPDB1" <<'EOF'
+SELECT object_name, status FROM user_objects WHERE object_type = 'PROCEDURE';
+EXIT
+EOF
+
 # Arrêter sans perdre les données
 docker compose down
 
@@ -244,7 +589,25 @@ docker compose down -v
 
 ---
 
+## ⚠️ Limitation connue
+
+La **migration automatique** d'une ligne entre Site1 et Site2 lors d'un UPDATE
+qui fait changer le seuil de quantité (ex: 50 → 150) n'est pas implémentée.
+
+Le trigger `SYC_UPDATE_LIGNE` met à jour la ligne sur le site d'origine sans la déplacer.
+Pour migrer manuellement une ligne de Site2 vers Site1 :
+
+```sql
+-- 1. Supprimer de l'ancien site
+EXEC eshop.delete_global(idligne);
+
+-- 2. Réinsérer avec la nouvelle quantité (sera routée vers le bon site)
+EXEC eshop.insert_global(idcommande, idproduit, nouvelle_quantite, prix, remise);
+```
+
+---
+
 ## Dépôts liés
 
-- **Frontend** : https://github.com/khalilbaidouri/eshop_front.git
-- **Backend** : https://github.com/khalilbaidouri/eshop_back.git
+- **Frontend** (Next.js 14) : https://github.com/khalilbaidouri/eshop_front.git
+- **Backend** (Spring Boot) : https://github.com/khalilbaidouri/eshop_back.git
